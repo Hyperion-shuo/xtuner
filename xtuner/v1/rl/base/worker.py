@@ -50,7 +50,7 @@ from xtuner.v1.utils import (
 from xtuner.v1.utils.load_spec import LoadEnum
 
 from ..loss_fn import kl_penalty
-from .loss import BaseRLLossConfig
+from .loss import BaseRLLossConfig, finalize_train_policy_metrics
 from .rollout_is import merge_rollout_is_metrics
 
 
@@ -631,7 +631,12 @@ class TrainingWorker(SingleAcceleratorWorker):
             else:
                 extra_info_dict = cast(dict, engine_extra_info)
 
-            extra_info_dict = {k: v.item() for k, v in extra_info_dict.items() if isinstance(v, torch.Tensor)}
+            extra_info_dict = {
+                k: v.item() if isinstance(v, torch.Tensor) else v
+                for k, v in extra_info_dict.items()
+                if isinstance(v, (torch.Tensor, int, float))
+            }
+            extra_info_dict = finalize_train_policy_metrics(extra_info_dict, DEVICE)
             train_step_info.pop("total_loss")  # type: ignore[misc]
 
             train_log_item = WorkerTrainLogItem(
