@@ -89,6 +89,19 @@ fi
 node_count=${NODE_COUNT:-1}
 
 WORK_DIR=$(realpath "$WORK_DIR")
+if [ "${XTUNER_WANDB_SYNC_TENSORBOARD:-}" = "1" ]; then
+  export WANDB_PROJECT=${WANDB_PROJECT:-xtuner}
+  export WANDB_NAME=${WANDB_NAME:-$(basename "$WORK_DIR")}
+  export WANDB_DIR=${WANDB_DIR:-${WORK_DIR}/wandb}
+  export WANDB_MODE=${WANDB_MODE:-offline}
+  mkdir -p "${WANDB_DIR}"
+  python -c "import wandb" >/dev/null 2>&1 || {
+    echo "XTUNER_WANDB_SYNC_TENSORBOARD=1 but wandb is not installed in the current Python environment."
+    echo "Install wandb in this environment or set XTUNER_WANDB_SYNC_TENSORBOARD=0 to disable W&B sync."
+    exit 1
+  }
+  echo "W&B TensorBoard sync enabled: project=${WANDB_PROJECT}, name=${WANDB_NAME}, dir=${WANDB_DIR}, mode=${WANDB_MODE}"
+fi
 if [ "$RAY_RANK" -eq 0 ]; then
   rm -rf /tmp/ray_log
   export RAY_LOG_DIR="${WORK_DIR}/ray_${current_time}/"
