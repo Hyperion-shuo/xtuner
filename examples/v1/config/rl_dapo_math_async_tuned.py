@@ -3,7 +3,7 @@ from pathlib import Path
 
 from xtuner.v1.config import AdamWConfig, FSDPConfig, LRConfig
 from xtuner.v1.data_proto.rl_data import SampleParams
-from xtuner.v1.rl.advantage import GRPOAdvantageConfig
+from xtuner.v1.rl.advantage.rloo_entropy import OverlongRLOOGroupEntropyAdvantageConfig
 from xtuner.v1.datasets.config import DataloaderConfig, DatasetConfig
 from xtuner.v1.datasets.rl_tokenize_fn import RLTextTokenizeFnConfig
 from xtuner.v1.model import get_model_config_from_hf
@@ -219,7 +219,15 @@ trainer = RLColocateTrainerConfig(
     evaluator_config=evaluator_config,
     load_from=model_path,
     train_batch_size=train_batch_size,
-    advantage_estimator_config=GRPOAdvantageConfig(eps=1e-8),
+    advantage_estimator_config=OverlongRLOOGroupEntropyAdvantageConfig(
+        entropy_upper_bound=0.65,
+        entropy_lower_bound=0.4,
+        tau_upper=0.0,
+        tau_lower=0.0,
+        coeff_min_upper=0.2,
+        coeff_min_lower=0.5,
+        overlong_filer=True,
+    ),
     enable_evaluate=True,
     enable_initial_evaluate=False,
     total_train_steps=500,

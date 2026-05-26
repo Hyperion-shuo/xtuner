@@ -14,7 +14,7 @@ from xtuner.v1.data_proto.rl_data import SampleParams
 from xtuner.v1.datasets.config import DataloaderConfig, DatasetConfig
 from xtuner.v1.datasets.rl_tokenize_fn import RLTextTokenizeFnConfig
 from xtuner.v1.model import get_model_config_from_hf
-from xtuner.v1.rl.advantage import GRPOAdvantageConfig
+from xtuner.v1.rl.advantage.rloo_entropy import OverlongRLOOGroupEntropyAdvantageConfig
 from xtuner.v1.rl.agent_loop import SingleTurnAgentLoopConfig
 from xtuner.v1.rl.agent_loop_manager import (
     AgentLoopManagerConfig,
@@ -55,22 +55,22 @@ max_response_length = 30 * 1024
 pack_max_length = 32 * 1024
 evaluate_step = 10 * sync_weights_interval
 
-max_staleness = 3
-oversample_threshold = 1.2
+max_staleness = 2
+oversample_threshold = 0.2
 tail_batch_trigger_size = 0
 enable_partial_rollout = True
 
 # 1. Resources: by default, 4 GPUs for train and 4 GPUs for rollout.
 train_resources = AcceleratorResourcesConfig(
     accelerator="GPU",
-    num_workers=int(os.environ.get("TRAIN_NUM_WORKERS", "4")) * NNODE,
+    num_workers=int(os.environ.get("TRAIN_NUM_WORKERS", "5")) * NNODE,
     num_cpus_per_worker=12,
     cpu_memory_per_worker=16 * 1024**3,
 )
 
 rollout_resources = AcceleratorResourcesConfig(
     accelerator="GPU",
-    num_workers=int(os.environ.get("ROLLOUT_NUM_WORKERS", "4")) * NNODE,
+    num_workers=int(os.environ.get("ROLLOUT_NUM_WORKERS", "3")) * NNODE,
     num_cpus_per_worker=12,
     cpu_memory_per_worker=16 * 1024**3,
 )
@@ -243,7 +243,15 @@ trainer = RLDisaggregatedTrainerConfig(
     evaluator_config=evaluator_config,
     load_from=model_path,
     train_batch_size=train_batch_size,
-    advantage_estimator_config=GRPOAdvantageConfig(eps=1e-8),
+    advantage_estimator_config=OverlongRLOOGroupEntropyAdvantageConfig(
+        entropy_upper_bound=0.65,
+        entropy_lower_bound=0.4,
+        tau_upper=0.0,
+        tau_lower=0.0,
+        coeff_min_upper=0.2,
+        coeff_min_lower=0.5,
+        overlong_filer=True,
+    ),
     total_train_steps=total_train_steps,
     sync_weights_interval=sync_weights_interval,
     enable_evaluate=True,
