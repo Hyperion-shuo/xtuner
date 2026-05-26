@@ -11,6 +11,7 @@ from xtuner.v1.rl.utils import AcceleratorResourcesConfig, CPUResourcesConfig
 from xtuner.v1.rl.rollout.worker import RolloutConfig
 from xtuner.v1.rl.judger import DapoMathJudgerConfig
 from xtuner.v1.rl.replay_buffer import AsyncReplayBufferConfig
+from xtuner.v1.rl.rollout_is import RolloutImportanceSampling
 from xtuner.v1.rl.trainer import WorkerConfig
 from xtuner.v1.rl.agent_loop import SingleTurnAgentLoopConfig
 from xtuner.v1.rl.agent_loop_manager import AgentLoopManagerConfig, AsyncProduceStrategyConfig, SamplerConfig, TaskSpecConfig
@@ -33,12 +34,17 @@ prompt_repeat_k = 16
 rollout_tp_size = 1
 rollout_ep_size = 1
 max_prompt_length = 2048
-max_response_length = 8192
-pack_max_length = 32768
-train_optimizer_steps = 16
+max_response_length = 30 * 1024
+pack_max_length = 32 * 1024
+train_optimizer_steps = 8
 hf_interval = 50 # not used
 enable_initial_evaluate = True # not used
-evaluate_step = 5
+evaluate_step = 10
+
+max_staleness = 2
+oversample_threshold = 0.5
+tail_batch_trigger_size = 0
+enable_partial_rollout = True
 
 # 1. resources
 resources = AcceleratorResourcesConfig(
@@ -101,6 +107,13 @@ loss_cfg = GRPOLossConfig(
     kl_loss_type="low_var_kl",
     mode=os.environ.get("LOSS_MODE", "chunk"),
     chunk_size=512,
+    rollout_is=RolloutImportanceSampling(
+        rollout_is_level="token",
+        rollout_is_mode="both",
+        rollout_is_threshold=(5, 0.5),
+        rollout_is_mask_threshold=(5, 0.5),
+        rollout_is_veto_threshold=(20, 0),
+    ),
 )
 train_worker_cfg = WorkerConfig(
     model_cfg=model_cfg,
@@ -140,10 +153,10 @@ agent_loop_config = SingleTurnAgentLoopConfig(
     sample_params=training_sample_params,
 )
 produce_strategy_config = AsyncProduceStrategyConfig(
-    over_sample_threshold=0.2,
-    enable_partial_rollout=True,
-    max_staleness=0,
-    tail_batch_trigger_size=256,
+    over_sample_threshold=oversample_threshold,
+    enable_partial_rollout=enable_partial_rollout,
+    max_staleness=max_staleness,
+    tail_batch_trigger_size=tail_batch_trigger_size,
 )
 agent_loop_manager_cfg = AgentLoopManagerConfig(
     tasks=TaskSpecConfig(
