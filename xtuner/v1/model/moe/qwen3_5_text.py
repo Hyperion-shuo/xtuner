@@ -76,6 +76,11 @@ class Qwen3_5_VLTextMoE(Qwen3VLTextMoE):
 
             # Handle fused weights
             n_routed_experts = self.config.n_routed_experts
+            if self.config.mtp_hf_expert_format == "fused":
+                key = key.replace("fused_w1w3.weight", "gate_up_proj")
+                key = key.replace("fused_w2.weight", "down_proj")
+                return [f"mtp.{key}"]
+
             if "fused_w1w3.weight" in key:
                 w1w3_keys: list[str] = []
 
@@ -123,13 +128,19 @@ class Qwen3_5_VLTextMoE(Qwen3VLTextMoE):
             return [key]
 
     def hf_tensor_to_canonical(self, name: str, loaded_tensor: torch.Tensor) -> torch.Tensor:
-        if "fused_w1w3.weight" in name and "mtp" not in name:
+        # For split MTP checkpoints HFLoadPlan already concatenates the 2D
+        # gate/up projections per expert in the order above. Fused
+        # checkpoints contain all experts in one 3D tensor, just like the trunk.
+        if name.startswith("mtp_block.") and self.config.mtp_hf_expert_format == "split":
+            return loaded_tensor
+
+        if "fused_w1w3.weight" in name:
             # hf: num_experts, 2 * expert_dim, hidden_size
             # xtuner: num_experts * 2 * expert_dim, hidden_size
             # num_experts * 2 * expert_dim, hidden_size
             loaded_tensor = loaded_tensor.flatten(0, 1)
 
-        elif "fused_w2.weight" in name and "mtp" not in name:
+        elif "fused_w2.weight" in name:
             # hf: num_experts, hidden_size, expert_dim
             # xtuner: num_experts * hidden_size, expert_dim
             loaded_tensor = loaded_tensor.flatten(0, 1)
@@ -141,7 +152,10 @@ class Qwen3_5_VLTextMoE(Qwen3VLTextMoE):
         safetensor: torch.Tensor,
         hf_param_name: str,
     ):
-        if "mtp" in hf_param_name:
+        # Legacy MTP export splits each expert into separate 2D projections.
+        # A fused MTP key needs the same 3D layout as a fused trunk key, including
+        # for the HF parameter iterator used by rollout weight updates.
+        if hf_param_name.startswith("mtp.") and self.config.mtp_hf_expert_format == "split":
             return safetensor
 
         assert isinstance(hf_param_name, str)
@@ -173,6 +187,15 @@ class Qwen3_5_VLTextMoE(Qwen3VLTextMoE):
 class Qwen3_5_VLTextMoEConfig(MoEConfig):
     with_shared_expert_gate: bool = True
     rms_norm_type: Literal["default", "zero_centered"] = "zero_centered"
+    mtp_hf_expert_format: Literal["fused", "split"] = Field(
+        default="split",
+        description=(
+            "MTP expert checkpoint layout, independent of the fused trunk layout. "
+            "Use 'fused' for original Qwen3.6 gate_up_proj/down_proj tensors, or "
+            "'split' for legacy per-expert gate_proj/up_proj/down_proj weights. "
+            "This controls both HF loading and export/rollout weight updates."
+        ),
+    )
     hf_save_cfg: HFSaveCfg = HFSaveCfg(
         fp32_keys_pattern=[
             r"model\.language_model\.layers\.\d+\.linear_attn\.norm\.weight",

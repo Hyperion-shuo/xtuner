@@ -149,6 +149,9 @@ class WorkerConfig(BaseModel):
             CPU and move each layer's slice to device during forward. Defaults to False.
         offload_old_logprobs (bool): Keep actor old log probabilities on CPU between
             metric computation and the optimizer step. Defaults to False.
+        train_mtp (bool): Compute MTP training losses. When False, retain the
+            model's MTP weights for checkpointing and rollout synchronization
+            but omit the MTP training branch. Defaults to True.
 
     **Examples:**
 
@@ -190,6 +193,7 @@ class WorkerConfig(BaseModel):
     free_rollout_routed_experts_in_worker: bool = True  # 默认不需要用户配置
     offload_rollout_routed_experts: bool = False
     offload_old_logprobs: bool = False
+    train_mtp: bool = True
     train_teacher_manager_config: TrainTeacherManagerConfig | None = None
 
     # sft config
@@ -317,7 +321,23 @@ class TrainingWorker(SingleAcceleratorWorker):
         else:
             mode = "eager"
         self.logprob_cfg = LogProbConfig(chunk_size=worker_cfg.loss_cfg.chunk_size, mode=mode)
+        self._init_mtp_training(worker_cfg)
+
+        self.update_weighter = WeightUpdater(
+            rank=self.rank,
+            logger=self.logger,
+            config=self.config,
+            engine=self._engine,
+        )
+
+    def _init_mtp_training(self, worker_cfg: WorkerConfig) -> None:
+        # Keep the module/config intact for weight sync, including rollout's
+        # empty-init path. With no MTP loss contexts the model skips its MTP
+        # forward entirely; grad stays None and AdamW does not update/decay it.
         self.mtp_config = None
+        if not worker_cfg.train_mtp:
+            self._mtp_trainable_parameters = []
+            return
         if isinstance(worker_cfg.model_cfg, BaseComposeConfig):
             if hasattr(worker_cfg.model_cfg.text_config, "mtp_config"):
                 self.mtp_config = worker_cfg.model_cfg.text_config.mtp_config
@@ -328,13 +348,6 @@ class TrainingWorker(SingleAcceleratorWorker):
             [parameter for name, parameter in self._engine.model.trainable_parameters() if "mtp_block" in name]
             if self.mtp_config is not None
             else []
-        )
-
-        self.update_weighter = WeightUpdater(
-            rank=self.rank,
-            logger=self.logger,
-            config=self.config,
-            engine=self._engine,
         )
 
     @ray_method
