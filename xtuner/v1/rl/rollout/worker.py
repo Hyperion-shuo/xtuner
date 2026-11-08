@@ -16,7 +16,7 @@ import ray
 import requests  # type: ignore[import-untyped]
 from cyclopts import Group, Parameter
 from packaging.version import Version
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from typing_extensions import Annotated
 
@@ -334,6 +334,11 @@ class RolloutConfig(BaseModel):
     ] = 1200.0
     turn_level_async: bool = False
     turn_max_active: int = 8
+    turn_trace_hard_bytes: int = Field(default_factory=lambda: int(os.environ.get("XTUNER_TRACE_HARD_BYTES", str(128 * 1024**3))), gt=0)
+    turn_trace_shards: int = Field(default_factory=lambda: int(os.environ.get("XTUNER_TRACE_SHARDS", "1")), ge=1, le=64)
+    turn_trace_metrics: bool = False
+    turn_route_reservation_bytes: int = 1024**3
+    turn_test_holds: bool = False
     session_server_timeout: Annotated[
         float,
         Parameter(
@@ -404,6 +409,23 @@ class RolloutConfig(BaseModel):
             help="Whether to enable prefix caching for the rollout worker.",
         ),
     ] = False
+    prefill_save_alignment: Annotated[
+        int, Parameter(group=infer_group, help="LMDeploy SSM prefill checkpoint alignment in tokens.")
+    ] = 1024
+    prefix_cache_state_budget: Annotated[
+        int, Parameter(group=infer_group, help="Extra LMDeploy SSM state units reserved for prefix checkpoints.")
+    ] = 0
+    prefix_cache_decode_save_first: Annotated[
+        bool,
+        Parameter(group=infer_group, help="Save the first safe LMDeploy SSM decode checkpoint after each prompt."),
+    ] = False
+    prefix_cache_decode_state_interval: Annotated[
+        int,
+        Parameter(group=infer_group, help="LMDeploy SSM decode checkpoint interval; zero disables periodic saves."),
+    ] = 0
+    prefill_save_last_only: Annotated[
+        bool, Parameter(group=infer_group, help="Save only the last safe LMDeploy SSM checkpoint of each prefill.")
+    ] = False
     worker_log_dir: Annotated[Path, Parameter(help="Directory to save worker logs.")] = Path.cwd() / "work_dir"
     health_check_interval_seconds: Annotated[
         float,
@@ -441,6 +463,10 @@ class RolloutConfig(BaseModel):
             help="Register rollout session servers to routed API proxy and keep registrations in sync with health.",
         ),
     ] = False
+    session_affinity: bool = Field(
+        default=False,
+        description="Register one HTTP router that binds each session to a concrete DP SessionServer.",
+    )
     routed_proxy_url: Annotated[
         str,
         Parameter(
@@ -526,6 +552,15 @@ class RolloutConfig(BaseModel):
 
         self.worker_log_dir.mkdir(parents=True, exist_ok=True)
 
+    def trace_store_env(self) -> dict[str, str]:
+        if self.turn_trace_hard_bytes < self.turn_trace_shards:
+            raise ValueError("trace budget must allocate at least one byte per shard")
+        return {
+            "XTUNER_TRACE_SHARDS": str(self.turn_trace_shards),
+            "XTUNER_TRACE_HARD_BYTES": str(self.turn_trace_hard_bytes),
+            "XTUNER_TRACE_METRICS": "1" if self.turn_trace_metrics else "0",
+        }
+
     def build(self, placement_group: "PlacementGroup"):
         """Build and return a Ray remote RolloutController from this config.
 
@@ -545,7 +580,7 @@ class RolloutConfig(BaseModel):
             name="rollout_controller",
             cpu_resources=CPUResourcesConfig(num_workers=num_workers),
         )
-        trace_env_vars = get_trace_env_vars()
+        trace_env_vars = {**get_trace_env_vars(), **self.trace_store_env()}
         actor_options: dict[str, Any] = {"num_cpus": num_workers}
         if trace_env_vars:
             actor_options["runtime_env"] = {"env_vars": trace_env_vars}
@@ -802,6 +837,11 @@ class RolloutWorker(SingleAcceleratorWorker):
                 enable_return_routed_experts=self.enable_return_routed_experts,
                 turn_level_async=self.config.turn_level_async,
                 turn_max_active=self.config.turn_max_active,
+                turn_trace_hard_bytes=self.config.turn_trace_hard_bytes,
+                turn_trace_shards=self.config.turn_trace_shards,
+                turn_trace_metrics=self.config.turn_trace_metrics,
+                turn_route_reservation_bytes=self.config.turn_route_reservation_bytes,
+                turn_test_holds=self.config.turn_test_holds,
             )
         )
         self.session_server_url = ray.get(

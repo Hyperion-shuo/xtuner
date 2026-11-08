@@ -669,6 +669,8 @@ class BaseRLTrainer:
     _distillation: DistillationTrainerAdapter
 
     def _init_common(self, cfg: BaseRLTrainerConfig, *, meta_path: str, logger_tag: str) -> None:
+        # Driver and newly launched actors must agree on trace topology.
+        os.environ.update(cfg.rollout_config.trace_store_env())
         distillation_config = cfg.distillation_config
         if distillation_config is not None and distillation_config.rollout_teachers:
             endpoint_map = json.loads(os.environ.get("XTUNER_OPD_TEACHER_ENDPOINTS_JSON", "{}"))

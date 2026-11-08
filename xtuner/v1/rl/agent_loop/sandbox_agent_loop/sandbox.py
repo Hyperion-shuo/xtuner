@@ -1184,6 +1184,48 @@ class SandboxPool:
     def spec(self, name: str) -> SandboxSpec:
         return self._specs[name]
 
+    async def release(self, name: str) -> None:
+        """Release one acquired sandbox group before the next stage starts.
+
+        Requires observable deletion. The provider stays open for subsequent
+        acquisitions. Failed/cancelled cleanup remains owned by release_all;
+        callers must not start a replacement stage when this method raises.
+        Call serially from a Trial's lifecycle, never concurrently with get.
+        """
+        self.validate_name(name)
+        if name not in self._clients:
+            return
+        query = getattr(self._provider, "get", None)
+        if query is None:
+            raise ValueError("Early release requires provider deletion status")
+        group = self._groups.get(name) or [
+            _SandboxLease(name="primary", client=self._clients[name], env_id=self._env_ids[name])
+        ]
+        env_ids = {lease.env_id for lease in group}
+        self._pending_verification_ids.update(env_ids)
+        diagnostic = {"name": name, "env_ids": sorted(env_ids), "phase": "early_release"}
+        self.cleanup.setdefault("early_releases", []).append(diagnostic)
+
+        async def finish() -> None:
+            await self._release_group(name, group)
+            if self._pending_delete_ids.intersection(env_ids):
+                raise RuntimeError("Early sandbox deletion failed")
+            for env_id in sorted(env_ids):
+                response = await query(env_id)
+                status = response.get("env", response).get("status")
+                diagnostic.setdefault("final_states", []).append({"env_id": env_id, "status": status})
+                if status != "deleted":
+                    raise RuntimeError("Early sandbox deletion not confirmed")
+            if any(lease.client in self._cleanup_clients for lease in group):
+                raise RuntimeError("Early sandbox client closure not confirmed")
+            # Keep IDs for final verification even after leases are removed.
+            self._clients.pop(name, None)
+            self._env_ids.pop(name, None)
+            self._urls.pop(name, None)
+            self._groups.pop(name, None)
+
+        await finalize_bounded(finish(), timeout_seconds=self._cleanup_timeout_sec, diagnostic=diagnostic)
+
     async def release_all(self) -> None:
         if (
             self.cleanup.get("ok")
@@ -1412,7 +1454,7 @@ class SandboxPool:
         # A stalled HTTP close must not prevent deleting the next dependency.
         # Preserve reverse dependency deletion, then close clients independently.
         leases = list(reversed(group))
-        self._cleanup_clients.extend(lease.client for lease in leases)
+        self._cleanup_clients.extend(lease.client for lease in leases if lease.client not in self._cleanup_clients)
         diagnostic = {"name": name, "phase": "delete_sandboxes"}
         self.cleanup.setdefault("group_releases", []).append(diagnostic)
         seconds = self._cleanup_timeout_sec

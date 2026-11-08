@@ -163,6 +163,40 @@ class TestSessionServerEndpointHandling(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.session_server.on_request.await_args.kwargs["trace_enabled"])
         self.session_server.on_response.assert_not_awaited()
 
+    async def test_prompt_ids_are_removed_only_from_agent_response(self):
+        prompt_ids = [42] * 32768
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.session_server.on_response.reset_mock()
+                data = {
+                    "id": "request-1", "prompt_token_ids": prompt_ids,
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                        "delta" if stream else "message": {"role": "assistant", "content": "ok"},
+                        "output_ids": [7], "output_token_logprobs": [[-0.1, 7]]}],
+                    "routed_experts": "route-ref", "usage": {"prompt_tokens": len(prompt_ids)},
+                }
+                raw = json.dumps(data).encode()
+                self.upstream_content_type = "text/event-stream" if stream else "application/json"
+                self.upstream_body = b"data: " + raw + b"\n\ndata: [DONE]\n\n" if stream else raw
+                response = await self.proxy_client.post("/v1/chat/completions", json={
+                    "model": "test-model", "session_id": "trace-session", "stream": stream,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "return_token_ids": True, "return_logprob": True, "return_routed_experts": True,
+                })
+                body = await response.read()
+                self.assertEqual(response.status, 200)
+                self.assertNotIn(b'"prompt_token_ids"', body)
+                self.assertLess(len(body), 1024)
+                cleaned = json.loads(body.split(b"\n")[0][6:] if stream else body)
+                self.assertEqual(cleaned["choices"][0]["output_ids"], [7])
+                self.assertEqual(cleaned["choices"][0]["output_token_logprobs"], [[-0.1, 7]])
+                self.assertEqual(cleaned["routed_experts"], "route-ref")
+                self.assertEqual(cleaned["id"], "request-1")
+                self.session_server.on_response.assert_awaited_once()
+                if not stream:
+                    self.assertEqual(self.session_server.on_response.await_args.args[0]["prompt_token_ids"], prompt_ids)
+                self.assertTrue(json.loads(self.upstream_calls[-1]["body"])["return_token_ids"])
+
     async def test_non_generation_endpoints_reach_upstream_without_trace(self):
         hello = await self.proxy_client.head("/api/hello")
         unknown = await self.proxy_client.post("/terminate", json={})

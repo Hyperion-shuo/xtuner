@@ -59,7 +59,11 @@ class RolloutController:
         self.proxy_manager: RolloutProxyManager | None = None
         if self.config.enable_proxy:
             self.proxy_manager = RolloutProxyManager(self.config)
-            self.register_active_workers_to_proxy()
+            try:
+                self.register_active_workers_to_proxy()
+            except BaseException:
+                self.proxy_manager.close()
+                raise
         self.health_manager = RolloutHealthManager(
             config=self.config,
             registry=self.registry,
@@ -140,6 +144,11 @@ class RolloutController:
             await self.turn_control("cancel_session", session_id=session_id, reason="probe_complete")
             await self.turn_control("drain", timeout=60)
             await release_existing_sessions([session_id])
+            self.retire_route_sessions([session_id])
+
+    def retire_route_sessions(self, session_ids):
+        if self.proxy_manager is not None:
+            self.proxy_manager.retire_sessions(session_ids)
 
     @trace_rollout_endpoint("rollout.controller.generate")
     @ray.method(concurrency_group=ROLLOUT_CONCURRENCY_GROUP_GENERATE)
@@ -227,7 +236,10 @@ class RolloutController:
             raise RuntimeError("turn-level worker failure requires stopping this run; recovery is not yet validated")
         async def broadcast(operation, arguments):
             replies = await asyncio.gather(*[
-                worker.actor.turn_control.remote(operation, **arguments) for worker in workers])
+                worker.actor.turn_control.remote(operation, **arguments) for worker in workers], return_exceptions=True)
+            errors = [reply for reply in replies if isinstance(reply, BaseException)]
+            if errors:
+                raise errors[0]
             replies = [reply for reply in replies if reply is not None]
             if not replies:
                 raise RuntimeError("no turn-level inference entrypoints")
@@ -242,7 +254,17 @@ class RolloutController:
                 raise RuntimeError("turn-level entrypoint was replaced; refusing unverified version recovery")
             if action == "status":
                 return statuses
-        replies = await broadcast(action, kwargs)
+        try:
+            replies = await broadcast(action, kwargs)
+        except BaseException:
+            if action == "open_admission":
+                # Some entrypoints may already have opened. Close every one
+                # before reporting failure; the manager must not resume Trials.
+                self.health_manager.pause()
+                await asyncio.gather(*[
+                    worker.actor.turn_control.remote("close_admission", epoch=kwargs["epoch"])
+                    for worker in workers], return_exceptions=True)
+            raise
         if action == "open_admission":
             self.health_manager.resume()
         return replies
@@ -308,11 +330,15 @@ class RolloutController:
     def shutdown(self):
         """Shut down all rollout workers tracked by the controller."""
         self.health_manager.stop()
-        actors = self.registry.all_actors()
-        ray.get(
-            [actor.shutdown.remote(stop_session_server=True) for actor in actors],  # type: ignore[attr-defined]
-            timeout=ROLLOUT_RAY_GET_TIMEOUT,
-        )
+        try:
+            if self.proxy_manager is not None:
+                self.proxy_manager.close()
+        finally:
+            actors = self.registry.all_actors()
+            ray.get(
+                [actor.shutdown.remote(stop_session_server=True) for actor in actors],  # type: ignore[attr-defined]
+                timeout=ROLLOUT_RAY_GET_TIMEOUT,
+            )
 
     def _broadcast_to_workers(self, method_name: str, target_state: WorkerLifecycleState, **kwargs):
         workers = self.registry.get_target_state_workers(target_state)
@@ -325,7 +351,7 @@ class RolloutController:
         )
         from xtuner.v1.rl.trace import get_trace_env_vars
 
-        trace_env_vars = get_trace_env_vars()
+        trace_env_vars = {**get_trace_env_vars(), **self.config.trace_store_env()}
         ray_kwargs = {}
         if trace_env_vars:
             ray_kwargs["runtime_env"] = {"env_vars": trace_env_vars}

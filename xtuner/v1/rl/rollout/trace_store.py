@@ -308,7 +308,7 @@ class RolloutTraceStore:
 
     def __init__(self, byte_limit: int | None = None, topology: tuple[int, int] | None = None):
         """Initialize the rollout trace store actor."""
-        self._metrics_enabled = os.environ.get("CYBERGYM_TRACE_METRICS", "0") == "1"
+        self._metrics_enabled = os.environ.get("XTUNER_TRACE_METRICS", "0") == "1"
         self._operation_metrics = {}
         self._gc_metrics = {"calls": 0, "seconds": 0.0, "max_seconds": 0.0}
         if self._metrics_enabled:
@@ -345,7 +345,7 @@ class RolloutTraceStore:
         self.smoke_held_sessions: set[str] = set()
         self.turn_owners: dict[str, str] = {}
         self.cancelled_turn_sessions: dict[str, str] = {}
-        total_limit = int(os.environ.get("CYBERGYM_TRACE_HARD_BYTES", str(128 * 1024**3)))
+        total_limit = int(os.environ.get("XTUNER_TRACE_HARD_BYTES", str(128 * 1024**3)))
         self.turn_byte_limit = total_limit if byte_limit is None else byte_limit
         self._topology = topology or (1, total_limit)
 
@@ -830,80 +830,33 @@ class RolloutTraceStore:
         return [self.objects[key] for key in keys if key in self.objects]
 
 
-def get_store():
-    """Process-local cached handle to the singleton store actor.
-
-    Fast path: ``ray.get_actor`` from the fixed XTuner rollout namespace if
-    another caller has already created it. Slow path: create the actor under
-    the reserved ``(namespace, name)`` pair; race with concurrent creators is
-    handled by catching the "name already taken" ValueError and re-looking-up.
-
-    Returns:
-        ActorHandle: Handle to the ``RolloutTraceStore`` actor.
-    """
-    global _handle_cache
+def _acquire_store(create):
+    global _handle_cache, _handle_topology
+    from .trace_shards import shard_count, trace_budget, acquire_shards
+    topology = (shard_count(), trace_budget())
     if _handle_cache is not None:
+        if globals().get('_handle_topology') != topology:
+            raise RuntimeError("trace shard topology or budget changed within this process")
         return _handle_cache
-    from .trace_shards import shard_count, acquire_shards
-    if shard_count() > 1:
-        _handle_cache = acquire_shards(RolloutTraceStore, _STORE_NAME, _STORE_NAMESPACE, create=True)
-        return _handle_cache
-
-    try:
-        _handle_cache = ray.get_actor(_STORE_NAME, namespace=_STORE_NAMESPACE)
-        if ray.get(_handle_cache.trace_topology.remote())[0] != 1:
-            _handle_cache = None
-            raise RuntimeError("single-shard client found a sharded trace run")
-        return _handle_cache
-    except ValueError:
-        pass
-
-    import time as _time
-
-    for attempt in range(10):
-        try:
-            _handle_cache = RolloutTraceStore.options(
-                name=_STORE_NAME,
-                namespace=_STORE_NAMESPACE,
-            ).remote()
-            return _handle_cache
-        except ValueError as exc:
-            try:
-                _handle_cache = ray.get_actor(_STORE_NAME, namespace=_STORE_NAMESPACE)
-                return _handle_cache
-            except ValueError:
-                get_logger().debug(f"RolloutTraceStore bootstrap retry {attempt}: {exc}")
-                _time.sleep(0.2 * (attempt + 1))
-                continue
-
-    raise RuntimeError(
-        f"RolloutTraceStore: failed to acquire named actor "
-        f"{_STORE_NAME!r} in namespace {_STORE_NAMESPACE!r} after retries"
-    )
+    handle = acquire_shards(RolloutTraceStore, _STORE_NAME, _STORE_NAMESPACE, create=create)
+    if handle is not None:
+        _handle_cache, _handle_topology = handle, topology
+    return handle
 
 
-# reasoning rl may be not initialized
+def get_store():
+    """Acquire session-affine stores; validate topology even for one shard."""
+    return _acquire_store(create=True)
+
+
 def get_existing_store():
-    """Return the existing singleton store actor without creating one."""
-    global _handle_cache
+    """Find existing trace owners without starting actors during cleanup."""
+    global _handle_cache, _handle_topology
     if not ray.is_initialized():
         _handle_cache = None
+        _handle_topology = None
         return None
-    if _handle_cache is not None:
-        return _handle_cache
-    from .trace_shards import shard_count, acquire_shards
-    if shard_count() > 1:
-        _handle_cache = acquire_shards(RolloutTraceStore, _STORE_NAME, _STORE_NAMESPACE, create=False)
-        return _handle_cache
-
-    try:
-        _handle_cache = ray.get_actor(_STORE_NAME, namespace=_STORE_NAMESPACE)
-        if ray.get(_handle_cache.trace_topology.remote())[0] != 1:
-            _handle_cache = None
-            raise RuntimeError("single-shard client found a sharded trace run")
-    except ValueError:
-        return None
-    return _handle_cache
+    return _acquire_store(create=False)
 
 
 async def release_existing_sessions(session_ids: list[str]) -> set[str]:

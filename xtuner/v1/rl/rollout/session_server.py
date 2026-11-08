@@ -304,6 +304,11 @@ class SessionServer:
         enable_return_routed_experts: bool = False,
         turn_level_async: bool = False,
         turn_max_active: int = 16,
+        turn_trace_hard_bytes: int = 128 * 1024**3,
+        turn_trace_shards: int = 1,
+        turn_trace_metrics: bool = False,
+        turn_route_reservation_bytes: int = 1024**3,
+        turn_test_holds: bool = False,
     ):
         self.worker_base_url = worker_base_url.rstrip("/")
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
@@ -312,7 +317,12 @@ class SessionServer:
         self.request_timeout = request_timeout
         self.read_bufsize = read_bufsize
         self.enable_return_routed_experts = enable_return_routed_experts
+        os.environ.update(XTUNER_TRACE_SHARDS=str(turn_trace_shards),
+                          XTUNER_TRACE_HARD_BYTES=str(turn_trace_hard_bytes),
+                          XTUNER_TRACE_METRICS="1" if turn_trace_metrics else "0")
         self.store = get_store()
+        self.turn_route_reservation_bytes = turn_route_reservation_bytes
+        self.turn_test_holds = turn_test_holds
         self.stop_word = self.tokenizer.eos_token or ""
 
         self._app: Optional[web.Application] = None
@@ -423,7 +433,7 @@ class SessionServer:
         if context is not None:
             prepared_at = time.perf_counter()
             prepared = await self.store.prepare_turn.remote(session_id, prompt_text, context["ticket"].request_id)
-            if os.environ.get("CYBERGYM_TRACE_METRICS", "0") == "1":
+            if os.environ.get("XTUNER_TRACE_METRICS", "0") == "1":
                 _turn_event("trace_prepare_rpc", context["ticket"], seconds=time.perf_counter() - prepared_at)
             prefix, prefix_ids = prepared["prefix"], prepared["input_ids"]
         else:
@@ -438,7 +448,7 @@ class SessionServer:
             context.update(prompt_key=prompt_text, prefix_handle=prepared["handle"],
                            delta_ids=delta_ids, delta_text=delta, input_ids=input_ids)
             await self.store.reserve_turn.remote(context["ticket"].request_id,
-                int(os.environ.get("CYBERGYM_ROUTE_RESERVATION_BYTES", str(1024**3))), session_id=session_id)
+                getattr(self, "turn_route_reservation_bytes", 1024**3), session_id=session_id)
 
         # 3. Inject extension fields on the forwarded request. The body still
         #    follows ``fmt``'s native schema. ``logprobs``/``top_logprobs`` are
@@ -545,7 +555,7 @@ class SessionServer:
             if raw_routed_expert is not None:
                 decode_at = time.perf_counter()
                 experts = await self._decode_routed_experts(raw_routed_expert)
-                if os.environ.get("CYBERGYM_TRACE_METRICS", "0") == "1":
+                if os.environ.get("XTUNER_TRACE_METRICS", "0") == "1":
                     _turn_event("trace_decode_rpc", ticket, seconds=time.perf_counter() - decode_at)
                 expected = len(context["input_ids"]) + len(output_token_ids) - 1
                 if len(experts) != expected:
@@ -575,7 +585,7 @@ class SessionServer:
                 if full_experts is not None:
                     ray.internal.free([full_experts], local_only=False)
                 raise
-            if os.environ.get("CYBERGYM_TRACE_METRICS", "0") == "1":
+            if os.environ.get("XTUNER_TRACE_METRICS", "0") == "1":
                 _turn_event("trace_commit_rpc", ticket, seconds=time.perf_counter() - commit_at)
             ticket.trace_committed = True
             _turn_event("trace_committed", ticket, prompt_tokens=len(context["input_ids"]),
@@ -721,7 +731,7 @@ class SessionServer:
         disconnected = lambda: request.transport is None or request.transport.is_closing()
         try:
             min_version = (await self.store.smoke_required_version.remote(session_id)
-                           if os.environ.get("CYBERGYM_SMOKE_CROSS_VERSION_TRIAL") else -1)
+                           if getattr(self, "turn_test_holds", False) else -1)
             async with gate.admit(session_id, disconnected, min_version=min_version) as ticket:
                 _turn_event("admitted", ticket, wait_seconds=ticket.admitted_at - ticket.enqueued_at)
                 token = _turn_context.set({"ticket": ticket})
@@ -1041,6 +1051,8 @@ class SessionServer:
         """Return a per-format ``data -> bool`` cleaner stripping injected
         fields."""
         drops = {
+            # Full prompt IDs stay in the internal trace, not every Agent response.
+            "prompt_token_ids": True,
             "output_token_logprobs": not orig_return_logprob,
             "output_ids": not orig_return_token_ids,
             "routed_experts": not orig_return_routed_experts,
@@ -1338,6 +1350,11 @@ class SessionServerActor:
         enable_return_routed_experts: bool = False,
         turn_level_async: bool = False,
         turn_max_active: int = 16,
+        turn_trace_hard_bytes: int = 128 * 1024**3,
+        turn_trace_shards: int = 1,
+        turn_trace_metrics: bool = False,
+        turn_route_reservation_bytes: int = 1024**3,
+        turn_test_holds: bool = False,
     ):
         self.worker_base_url = worker_base_url
         self.tokenizer_path = tokenizer_path
@@ -1347,6 +1364,11 @@ class SessionServerActor:
         self.enable_return_routed_experts = enable_return_routed_experts
         self.turn_level_async = turn_level_async
         self.turn_max_active = turn_max_active
+        self.turn_trace_hard_bytes = turn_trace_hard_bytes
+        self.turn_trace_shards = turn_trace_shards
+        self.turn_trace_metrics = turn_trace_metrics
+        self.turn_route_reservation_bytes = turn_route_reservation_bytes
+        self.turn_test_holds = turn_test_holds
         self.server: SessionServer | None = None
 
     @property
@@ -1366,6 +1388,11 @@ class SessionServerActor:
             enable_return_routed_experts=self.enable_return_routed_experts,
             turn_level_async=self.turn_level_async,
             turn_max_active=self.turn_max_active,
+            turn_trace_hard_bytes=self.turn_trace_hard_bytes,
+            turn_trace_shards=self.turn_trace_shards,
+            turn_trace_metrics=self.turn_trace_metrics,
+            turn_route_reservation_bytes=self.turn_route_reservation_bytes,
+            turn_test_holds=self.turn_test_holds,
         )
         await self.server.start()
         return self.server.url

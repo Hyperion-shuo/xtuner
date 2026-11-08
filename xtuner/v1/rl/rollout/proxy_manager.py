@@ -30,8 +30,17 @@ class RolloutProxyManager(RolloutWorkerLifecycleListener):
         self._routed_proxy_admin_url = config.routed_proxy_admin_url
         self._registered_session_urls: set[str] = set()
         self._logger = get_logger(log_dir=config.worker_log_dir, tag="RolloutProxyManager")
+        self._affinity = None
+        if config.session_affinity:
+            import ray
+            from .affinity_router import SessionAffinityService
+            self._affinity = SessionAffinityService(ray.util.get_node_ip_address())
 
     def replace_registered_session_urls(self, session_urls: Iterable[str]) -> None:
+        session_urls = sorted(set(session_urls))
+        if self._affinity is not None:
+            self._affinity.invoke("replace_backends", session_urls)
+            session_urls = [self._affinity.url]
         model_name = self._get_model_name()
         delete_from_routedapiproxy(self._routed_proxy_admin_url, model_name)
         self._registered_session_urls.clear()
@@ -55,13 +64,31 @@ class RolloutProxyManager(RolloutWorkerLifecycleListener):
         """Remove inactive request entrypoints from routed API proxy."""
         for worker in group.workers:
             if worker.is_request_entrypoint:
-                self._delete_session_url(worker.session_url)
+                if self._affinity is not None:
+                    self._affinity.invoke("set_backend", worker.session_url, False)
+                else:
+                    self._delete_session_url(worker.session_url)
 
     def on_worker_group_active(self, group: "WorkerGroup") -> None:
         """Register active request entrypoints to routed API proxy."""
         for worker in group.workers:
             if worker.is_request_entrypoint:
-                self._register_session_url(worker.session_url)
+                if self._affinity is not None:
+                    self._affinity.invoke("set_backend", worker.session_url, True)
+                else:
+                    self._register_session_url(worker.session_url)
+
+    def retire_sessions(self, session_ids) -> None:
+        if self._affinity is not None:
+            self._affinity.invoke("retire_sessions", session_ids)
+
+    def close(self) -> None:
+        try:
+            for url in list(self._registered_session_urls):
+                self._delete_session_url(url, raise_on_error=True)
+        finally:
+            if self._affinity is not None:
+                self._affinity.close()
 
     def _register_session_url(
         self,

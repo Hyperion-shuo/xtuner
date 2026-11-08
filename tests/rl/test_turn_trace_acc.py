@@ -123,7 +123,7 @@ def test_cancelled_prepare_does_not_commit_or_lose_reservation():
 
 
 def test_metrics_are_observational(monkeypatch):
-    monkeypatch.setenv('CYBERGYM_TRACE_METRICS','1')
+    monkeypatch.setenv('XTUNER_TRACE_METRICS','1')
     s=store();commit(s,'s','P','A','r')
     metrics=s.trace_metrics()
     assert metrics['operations']['prepare_turn']['calls']==1

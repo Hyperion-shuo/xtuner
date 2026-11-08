@@ -73,6 +73,13 @@ class ShardedTraceStore:
         return _Method(self, name)
 
 
+def trace_budget():
+    total = int(os.environ.get('XTUNER_TRACE_HARD_BYTES', str(128 * 1024**3)))
+    if total < shard_count():
+        raise ValueError('trace budget must allocate at least one byte per shard')
+    return total
+
+
 def shard_count():
     count = int(os.environ.get('XTUNER_TRACE_SHARDS', '1'))
     if not 1 <= count <= 64:
@@ -82,7 +89,7 @@ def shard_count():
 
 def acquire_shards(actor_class, name, namespace, create):
     count = shard_count()
-    total = int(os.environ.get('CYBERGYM_TRACE_HARD_BYTES', str(128 * 1024**3)))
+    total = trace_budget()
     actors = []
     for index in range(count):
         actor_name = name if index == 0 else f'{name}-shard-{index}'
@@ -100,4 +107,4 @@ def acquire_shards(actor_class, name, namespace, create):
     topologies = ray.get([actor.trace_topology.remote() for actor in actors])
     if any(tuple(value) != (count, total) for value in topologies):
         raise RuntimeError('trace shard topology or budget differs from existing run')
-    return ShardedTraceStore(actors)
+    return ShardedTraceStore(actors) if count > 1 else actors[0]

@@ -361,7 +361,7 @@ class TestRolloutController(unittest.IsolatedAsyncioTestCase):
 
     def _build_controller(self, router):
         controller = RolloutController.__new__(RolloutController)
-        controller.config = SimpleNamespace(rollout_timeout=1.0, random_seed=0)
+        controller.config = SimpleNamespace(rollout_timeout=1.0, random_seed=0, turn_level_async=False)
         controller.timeout_multiplier = 1.0
         controller.router = router
         controller.logger = MagicMock()
@@ -443,11 +443,12 @@ class TestRolloutController(unittest.IsolatedAsyncioTestCase):
 
         controller.register_active_workers_to_proxy()
 
-    def test_validate_registered_workers_to_proxy_delegates_proxy_validation(self):
+    async def test_validate_registered_workers_to_proxy_delegates_proxy_validation(self):
         controller = RolloutController.__new__(RolloutController)
         controller.proxy_manager = MagicMock()
 
-        controller.validate_registered_workers_to_proxy()
+        controller.config = SimpleNamespace(turn_level_async=False)
+        await controller.validate_registered_workers_to_proxy()
 
         controller.proxy_manager.validate_registered_session_urls.assert_called_once_with()
 
@@ -507,8 +508,29 @@ class TestRolloutProxyManager(unittest.TestCase):
             routed_proxy_url=self._ROUTED_PROXY_URL,
             routed_proxy_admin_url=self._ROUTED_PROXY_ADMIN_URL,
             worker_log_dir=None,
+            session_affinity=False,
         )
         return RolloutProxyManager(config)
+
+    def test_affinity_registers_only_router_and_keeps_it_during_worker_failure(self):
+        manager = self._build_manager()
+        manager._affinity = MagicMock(url="http://affinity-router")
+        with (
+            patch("xtuner.v1.rl.rollout.proxy_manager.delete_from_routedapiproxy") as delete_proxy,
+            patch("xtuner.v1.rl.rollout.proxy_manager.register_to_routedapiproxy") as register_proxy,
+        ):
+            manager.replace_registered_session_urls(["http://dp0", "http://dp1"])
+            register_proxy.assert_called_once_with(self._ROUTED_PROXY_ADMIN_URL, "test-model", "http://affinity-router")
+            manager._affinity.invoke.assert_called_once_with("replace_backends", ["http://dp0", "http://dp1"])
+            worker = SimpleNamespace(is_request_entrypoint=True, session_url="http://dp0")
+            manager.on_worker_group_inactive(SimpleNamespace(workers=[worker]))
+            manager._affinity.invoke.assert_called_with("set_backend", "http://dp0", False)
+            assert delete_proxy.call_count == 1  # initial registration only
+            manager.retire_sessions(["trial"])
+            manager._affinity.invoke.assert_called_with("retire_sessions", ["trial"])
+            manager.close()
+            delete_proxy.assert_called_with(self._ROUTED_PROXY_ADMIN_URL, "test-model", "http://affinity-router")
+            manager._affinity.close.assert_called_once_with()
 
     def test_replace_registered_session_urls_replaces_proxy_registrations(self):
         manager = self._build_manager()
@@ -540,7 +562,7 @@ class TestRolloutProxyManager(unittest.TestCase):
         ):
             manager.validate_registered_session_urls()
 
-        check_chat.assert_called_once_with(self._ROUTED_PROXY_URL, "test-model")
+        check_chat.assert_called_once_with(self._ROUTED_PROXY_URL, "test-model", session_id=None)
 
     def test_validate_registered_session_urls_raises_when_proxy_validation_fails(self):
         manager = self._build_manager()
@@ -553,7 +575,7 @@ class TestRolloutProxyManager(unittest.TestCase):
         ):
             manager.validate_registered_session_urls()
 
-        check_chat.assert_has_calls([call(self._ROUTED_PROXY_URL, "test-model")] * manager._CHECK_ATTEMPTS)
+        check_chat.assert_has_calls([call(self._ROUTED_PROXY_URL, "test-model", session_id=None)] * manager._CHECK_ATTEMPTS)
 
     def test_validate_registered_session_urls_noops_without_registrations(self):
         manager = self._build_manager()
