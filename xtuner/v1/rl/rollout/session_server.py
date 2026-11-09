@@ -324,6 +324,11 @@ class SessionServer:
         self.turn_route_reservation_bytes = turn_route_reservation_bytes
         self.turn_test_holds = turn_test_holds
         self.stop_word = self.tokenizer.eos_token or ""
+        # GLM5.3's template ends an assistant message without an EOS suffix.
+        # Its next user/observation marker is emitted by the following message.
+        model_config_path = Path(tokenizer_path) / "config.json"
+        model_config = json.loads(model_config_path.read_text()) if model_config_path.is_file() else {}
+        self.template_omits_assistant_eos = "Glm5NextForConditionalGeneration" in model_config.get("architectures", [])
 
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
@@ -541,7 +546,10 @@ class SessionServer:
                 tokenize=False,
             )
         ).rstrip()
-        assert new_prompt.startswith(old_prompt) and new_prompt.endswith(self.stop_word)
+        if not new_prompt.startswith(old_prompt):
+            raise ValueError("assistant template changed the admitted prompt prefix")
+        if not getattr(self, "template_omits_assistant_eos", False) and not new_prompt.endswith(self.stop_word):
+            raise ValueError("assistant template omitted its required EOS suffix")
 
         context = _turn_context.get()
         if context is not None:

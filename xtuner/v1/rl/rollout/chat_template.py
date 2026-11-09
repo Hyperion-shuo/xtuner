@@ -22,6 +22,11 @@ def canonicalize_messages_for_chat_template(messages: list[dict]) -> list[dict]:
 
     messages = copy.deepcopy(messages)
     for message in messages:
+        # OpenAI reasoning-only responses may contain content=null, while the
+        # recorder omits that field. Both represent empty text. GLM templates
+        # otherwise stringify None and create different trace endpoint keys.
+        if message.get("content") is None:
+            message["content"] = ""
         tool_calls = message.get("tool_calls")
         if not isinstance(tool_calls, list):
             continue
